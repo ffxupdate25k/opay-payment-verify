@@ -1,0 +1,182 @@
+"""
+Payment verification API - Vercel deployment version.
+
+Same three jobs as the local version:
+1. POST /api/request-payment  -> bot creates a pending payment request
+2. POST /api/notify           -> phone (Termux) reports a parsed notification
+3. GET  /api/verify/<req_id>  -> bot checks status when user taps "Verify Payment"
+
+Storage is Vercel KV (Redis) instead of an in-memory dict, since serverless
+functions don't keep memory between requests. See kv.py for details.
+"""
+
+import time
+import uuid
+import difflib
+from flask import Flask, request, jsonify
+
+from kv import kv_get, kv_set, kv_sadd, kv_srem, kv_smembers
+
+app = Flask(__name__)
+
+# --- config ------------------------------------------------------------
+# IMPORTANT: set these as real secrets in Vercel's Environment Variables
+# settings before going live - do not leave the defaults below in production.
+import os
+PHONE_SECRET = os.environ.get("de1f96cb803a2fa24c13e71222b305b8ae2a3a6e67d7376b05052c6a9284c0f1", "change-me-phone-secret")
+BOT_SECRET = os.environ.get("c0fa91f98a8c53e8b7f07e03b3d6318597067b1f88360b2ee9a00625d4095617", "change-me-bot-secret")
+NAME_MATCH_THRESHOLD = 0.72
+REQUEST_EXPIRY_SECONDS = 60 * 30
+
+PENDING_INDEX_KEY = "pending_index"  # a KV set of request_ids currently pending
+
+
+def now():
+    return time.time()
+
+
+def names_match(typed_name: str, notification_name: str) -> bool:
+    a = typed_name.strip().lower()
+    b = notification_name.strip().lower()
+    return difflib.SequenceMatcher(None, a, b).ratio() >= NAME_MATCH_THRESHOLD
+
+
+def amounts_match(expected: str, received: str) -> bool:
+    try:
+        return abs(float(expected) - float(received)) < 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def payment_key(request_id):
+    return f"payment:{request_id}"
+
+
+def load_payment(request_id):
+    return kv_get(payment_key(request_id))
+
+
+def save_payment(request_id, data):
+    kv_set(payment_key(request_id), data)
+
+
+def cleanup_expired(request_id, r):
+    if r["status"] == "pending" and (now() - r["created_at"]) > REQUEST_EXPIRY_SECONDS:
+        r["status"] = "expired"
+        save_payment(request_id, r)
+        kv_srem(PENDING_INDEX_KEY, request_id)
+    return r
+
+
+# --- 1. bot creates a pending payment request ---------------------------
+@app.route("/api/request-payment", methods=["POST"])
+def request_payment():
+    if request.headers.get("Authorization") != BOT_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True)
+    required = ["user_id", "amount", "sender_name", "sender_account", "sender_bank"]
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"error": f"missing fields: {missing}"}), 400
+
+    request_id = str(uuid.uuid4())
+    record = {
+        "user_id": data["user_id"],
+        "amount": str(data["amount"]),
+        "sender_name": data["sender_name"],
+        "sender_account": data["sender_account"],
+        "sender_bank": data["sender_bank"],
+        "status": "pending",
+        "created_at": now(),
+        "matched_notification": None,
+        "fail_reason": None,
+    }
+    save_payment(request_id, record)
+    kv_sadd(PENDING_INDEX_KEY, request_id)
+
+    return jsonify({"request_id": request_id, "status": "pending"})
+
+
+# --- 2. phone sends parsed notification data -----------------------------
+@app.route("/api/notify", methods=["POST"])
+def notify():
+    if request.headers.get("Authorization") != PHONE_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True)
+    received_amount = data.get("amount")
+    received_sender = data.get("sender_name") or ""
+    raw = data.get("raw", "")
+
+    if not received_amount:
+        return jsonify({"error": "no amount parsed"}), 400
+
+    pending_ids = kv_smembers(PENDING_INDEX_KEY)
+    candidates = []
+    for rid in pending_ids:
+        r = load_payment(rid)
+        if not r:
+            continue
+        r = cleanup_expired(rid, r)
+        if r["status"] == "pending" and names_match(r["sender_name"], received_sender):
+            candidates.append((rid, r))
+
+    if not candidates:
+        return jsonify({"matched": False, "reason": "no pending request for this sender"})
+
+    match_found = None
+    failed_ids = []
+    for request_id, r in candidates:
+        if amounts_match(r["amount"], received_amount):
+            r["status"] = "matched"
+            r["matched_notification"] = raw
+            save_payment(request_id, r)
+            kv_srem(PENDING_INDEX_KEY, request_id)
+            match_found = request_id
+        else:
+            r["status"] = "failed"
+            r["fail_reason"] = f"expected ₦{r['amount']} but received ₦{received_amount}"
+            r["matched_notification"] = raw
+            save_payment(request_id, r)
+            kv_srem(PENDING_INDEX_KEY, request_id)
+            failed_ids.append(request_id)
+
+    if match_found:
+        return jsonify({"matched": True, "request_id": match_found})
+
+    return jsonify({"matched": False, "failed_request_ids": failed_ids, "reason": "amount mismatch"})
+
+
+# --- 3. bot checks status when user taps "Verify Payment" -----------------
+@app.route("/api/verify/<request_id>", methods=["GET"])
+def verify(request_id):
+    if request.headers.get("Authorization") != BOT_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
+
+    r = load_payment(request_id)
+    if not r:
+        return jsonify({"error": "not found"}), 404
+
+    r = cleanup_expired(request_id, r)
+
+    if r["status"] == "matched":
+        r["status"] = "confirmed"
+        save_payment(request_id, r)
+        return jsonify({"status": "confirmed", "detail": r["matched_notification"]})
+
+    if r["status"] == "failed":
+        return jsonify({
+            "status": "failed",
+            "reason": r.get("fail_reason"),
+            "detail": r.get("matched_notification"),
+        })
+
+    return jsonify({"status": r["status"]})
+
+
+# --- simple health check --------------------------------------------------
+@app.route("/api/index", methods=["GET"])
+@app.route("/api", methods=["GET"])
+def health():
+    return jsonify({"ok": True, "service": "opay payment verification api"})
