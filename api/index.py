@@ -1,36 +1,89 @@
 """
-Payment verification API - Vercel deployment version.
+Payment verification API - Vercel deployment version (single file).
 
-Same three jobs as the local version:
+Combined into one file because Vercel's Python builder only packages the
+exact file listed in vercel.json - it does not automatically bundle sibling
+files like a separate kv.py, which caused a ModuleNotFoundError.
+
+Three jobs:
 1. POST /api/request-payment  -> bot creates a pending payment request
 2. POST /api/notify           -> phone (Termux) reports a parsed notification
 3. GET  /api/verify/<req_id>  -> bot checks status when user taps "Verify Payment"
 
-Storage is Vercel KV (Redis) instead of an in-memory dict, since serverless
-functions don't keep memory between requests. See kv.py for details.
+Storage is Vercel KV (Redis) via its REST API. Falls back to an in-memory
+dict automatically if KV env vars aren't set (useful for local testing only -
+in-memory storage will NOT persist between requests once deployed, since
+serverless functions don't keep memory between invocations).
 """
 
+import os
 import time
 import uuid
+import json
 import difflib
+import requests
 from flask import Flask, request, jsonify
-
-from kv import kv_get, kv_set, kv_sadd, kv_srem, kv_smembers
 
 app = Flask(__name__)
 
 # --- config ------------------------------------------------------------
-# IMPORTANT: set these as real secrets in Vercel's Environment Variables
-# settings before going live - do not leave the defaults below in production.
-import os
 PHONE_SECRET = os.environ.get("de1f96cb803a2fa24c13e71222b305b8ae2a3a6e67d7376b05052c6a9284c0f1", "change-me-phone-secret")
 BOT_SECRET = os.environ.get("c0fa91f98a8c53e8b7f07e03b3d6318597067b1f88360b2ee9a00625d4095617", "change-me-bot-secret")
 NAME_MATCH_THRESHOLD = 0.72
 REQUEST_EXPIRY_SECONDS = 60 * 30
 
-PENDING_INDEX_KEY = "pending_index"  # a KV set of request_ids currently pending
+PENDING_INDEX_KEY = "pending_index"
+
+KV_URL = os.environ.get("KV_REST_API_URL")
+KV_TOKEN = os.environ.get("KV_REST_API_TOKEN")
+USE_LOCAL_FALLBACK = not (KV_URL and KV_TOKEN)
+
+_local_store = {}
+_local_sets = {}
 
 
+# --- storage helpers (KV or local fallback) ------------------------------
+def _headers():
+    return {"Authorization": f"Bearer {KV_TOKEN}"}
+
+
+def kv_get(key):
+    if USE_LOCAL_FALLBACK:
+        return _local_store.get(key)
+    r = requests.get(f"{KV_URL}/get/{key}", headers=_headers(), timeout=10)
+    val = r.json().get("result")
+    return json.loads(val) if val else None
+
+
+def kv_set(key, value):
+    if USE_LOCAL_FALLBACK:
+        _local_store[key] = value
+        return
+    requests.post(f"{KV_URL}/set/{key}", headers=_headers(), data=json.dumps(value), timeout=10)
+
+
+def kv_sadd(set_key, member):
+    if USE_LOCAL_FALLBACK:
+        _local_sets.setdefault(set_key, set()).add(member)
+        return
+    requests.post(f"{KV_URL}/sadd/{set_key}/{member}", headers=_headers(), timeout=10)
+
+
+def kv_srem(set_key, member):
+    if USE_LOCAL_FALLBACK:
+        _local_sets.get(set_key, set()).discard(member)
+        return
+    requests.post(f"{KV_URL}/srem/{set_key}/{member}", headers=_headers(), timeout=10)
+
+
+def kv_smembers(set_key):
+    if USE_LOCAL_FALLBACK:
+        return list(_local_sets.get(set_key, set()))
+    r = requests.get(f"{KV_URL}/smembers/{set_key}", headers=_headers(), timeout=10)
+    return r.json().get("result", [])
+
+
+# --- business logic helpers ------------------------------------------------
 def now():
     return time.time()
 
@@ -178,5 +231,6 @@ def verify(request_id):
 # --- simple health check --------------------------------------------------
 @app.route("/api/index", methods=["GET"])
 @app.route("/api", methods=["GET"])
+@app.route("/", methods=["GET"])
 def health():
     return jsonify({"ok": True, "service": "opay payment verification api"})
