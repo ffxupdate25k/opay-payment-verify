@@ -27,8 +27,8 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # --- config ------------------------------------------------------------
-PHONE_SECRET = os.environ.get("de1f96cb803a2fa24c13e71222b305b8ae2a3a6e67d7376b05052c6a9284c0f1", "change-me-phone-secret").strip()
-BOT_SECRET = os.environ.get("becb578a9771e58592bc3837f0b7fe3b6c1ae1e3735b9955b7d999cbc6e6bc72", "change-me-bot-secret").strip()
+PHONE_SECRET = os.environ.get("PHONE_SECRET", "").strip()
+BOT_SECRET = os.environ.get("BOT_SECRET", "").strip()
 NAME_MATCH_THRESHOLD = 0.72
 REQUEST_EXPIRY_SECONDS = 60 * 30
 
