@@ -27,8 +27,8 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # --- config ------------------------------------------------------------
-PHONE_SECRET = os.environ.get("de1f96cb803a2fa24c13e71222b305b8ae2a3a6e67d7376b05052c6a9284c0f1", "change-me-phone-secret")
-BOT_SECRET = os.environ.get("c0fa91f98a8c53e8b7f07e03b3d6318597067b1f88360b2ee9a00625d4095617", "change-me-bot-secret")
+PHONE_SECRET = os.environ.get("de1f96cb803a2fa24c13e71222b305b8ae2a3a6e67d7376b05052c6a9284c0f1", "change-me-phone-secret").strip()
+BOT_SECRET = os.environ.get("becb578a9771e58592bc3837f0b7fe3b6c1ae1e3735b9955b7d999cbc6e6bc72", "change-me-bot-secret").strip()
 NAME_MATCH_THRESHOLD = 0.72
 REQUEST_EXPIRY_SECONDS = 60 * 30
 
@@ -121,10 +121,15 @@ def cleanup_expired(request_id, r):
     return r
 
 
+def check_auth(expected_secret):
+    provided = request.headers.get("Authorization", "").strip()
+    return provided == expected_secret
+
+
 # --- 1. bot creates a pending payment request ---------------------------
 @app.route("/api/request-payment", methods=["POST"])
 def request_payment():
-    if request.headers.get("Authorization") != BOT_SECRET:
+    if not check_auth(BOT_SECRET):
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(force=True)
@@ -154,7 +159,7 @@ def request_payment():
 # --- 2. phone sends parsed notification data -----------------------------
 @app.route("/api/notify", methods=["POST"])
 def notify():
-    if request.headers.get("Authorization") != PHONE_SECRET:
+    if not check_auth(PHONE_SECRET):
         return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(force=True)
@@ -204,7 +209,7 @@ def notify():
 # --- 3. bot checks status when user taps "Verify Payment" -----------------
 @app.route("/api/verify/<request_id>", methods=["GET"])
 def verify(request_id):
-    if request.headers.get("Authorization") != BOT_SECRET:
+    if not check_auth(BOT_SECRET):
         return jsonify({"error": "unauthorized"}), 401
 
     r = load_payment(request_id)
