@@ -233,6 +233,18 @@ def verify(request_id):
     return jsonify({"status": r["status"]})
 
 
+# --- TEMPORARY debug endpoint - remove once secrets are confirmed working --
+@app.route("/api/debug-secret", methods=["GET"])
+def debug_secret():
+    return jsonify({
+        "bot_secret_length": len(BOT_SECRET),
+        "bot_secret_first4": BOT_SECRET[:4],
+        "bot_secret_last4": BOT_SECRET[-4:],
+        "phone_secret_length": len(PHONE_SECRET),
+        "using_default_bot_secret": BOT_SECRET == "change-me-bot-secret",
+    })
+
+
 # --- simple health check --------------------------------------------------
 @app.route("/api/index", methods=["GET"])
 @app.route("/api", methods=["GET"])
