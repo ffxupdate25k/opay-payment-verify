@@ -1,21 +1,3 @@
-"""
-Payment verification API - Vercel deployment version (single file).
-
-Combined into one file because Vercel's Python builder only packages the
-exact file listed in vercel.json - it does not automatically bundle sibling
-files like a separate kv.py, which caused a ModuleNotFoundError.
-
-Three jobs:
-1. POST /api/request-payment  -> bot creates a pending payment request
-2. POST /api/notify           -> phone (Termux) reports a parsed notification
-3. GET  /api/verify/<req_id>  -> bot checks status when user taps "Verify Payment"
-
-Storage is Vercel KV (Redis) via its REST API. Falls back to an in-memory
-dict automatically if KV env vars aren't set (useful for local testing only -
-in-memory storage will NOT persist between requests once deployed, since
-serverless functions don't keep memory between invocations).
-"""
-
 import os
 import time
 import uuid
@@ -26,9 +8,9 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# --- config ------------------------------------------------------------
 PHONE_SECRET = os.environ.get("PHONE_SECRET", "").strip()
 BOT_SECRET = os.environ.get("BOT_SECRET", "").strip()
+
 NAME_MATCH_THRESHOLD = 0.72
 REQUEST_EXPIRY_SECONDS = 60 * 30
 
@@ -36,13 +18,13 @@ PENDING_INDEX_KEY = "pending_index"
 
 KV_URL = os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL")
 KV_TOKEN = os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+
 USE_LOCAL_FALLBACK = not (KV_URL and KV_TOKEN)
 
 _local_store = {}
 _local_sets = {}
 
 
-# --- storage helpers (KV or local fallback) ------------------------------
 def _headers():
     return {"Authorization": f"Bearer {KV_TOKEN}"}
 
@@ -50,20 +32,442 @@ def _headers():
 def kv_get(key):
     if USE_LOCAL_FALLBACK:
         return _local_store.get(key)
-    r = requests.get(f"{KV_URL}/get/{key}", headers=_headers(), timeout=10)
+
+    r = requests.get(
+        f"{KV_URL}/get/{key}",
+        headers=_headers(),
+        timeout=10
+    )
+
     val = r.json().get("result")
-    return json.loads(val) if val else None
+
+    if val:
+        return json.loads(val)
+
+    return None
 
 
 def kv_set(key, value):
     if USE_LOCAL_FALLBACK:
         _local_store[key] = value
         return
-    requests.post(f"{KV_URL}/set/{key}", headers=_headers(), data=json.dumps(value), timeout=10)
+
+    requests.post(
+        f"{KV_URL}/set/{key}",
+        headers=_headers(),
+        data=json.dumps(value),
+        timeout=10
+    )
 
 
 def kv_sadd(set_key, member):
     if USE_LOCAL_FALLBACK:
+        _local_sets.setdefault(set_key, set()).add(member)
+        return
+
+    requests.post(
+        f"{KV_URL}/sadd/{set_key}/{member}",
+        headers=_headers(),
+        timeout=10
+    )
+
+
+def kv_srem(set_key, member):
+    if USE_LOCAL_FALLBACK:
+        _local_sets.get(set_key, set()).discard(member)
+        return
+
+    requests.post(
+        f"{KV_URL}/srem/{set_key}/{member}",
+        headers=_headers(),
+        timeout=10
+    )
+
+
+def kv_smembers(set_key):
+    if USE_LOCAL_FALLBACK:
+        return list(_local_sets.get(set_key, set()))
+
+    r = requests.get(
+        f"{KV_URL}/smembers/{set_key}",
+        headers=_headers(),
+        timeout=10
+    )
+
+    return r.json().get("result", [])
+
+
+def now():
+    return time.time()
+
+
+def normalize_name(name):
+    return " ".join(str(name or "").strip().lower().split())
+
+
+def names_match(a, b):
+    a = normalize_name(a)
+    b = normalize_name(b)
+
+    if not a or not b:
+        return False
+
+    if a == b:
+        return True
+
+    return difflib.SequenceMatcher(None, a, b).ratio() >= NAME_MATCH_THRESHOLD
+
+
+def amounts_match(expected, received):
+    try:
+        return abs(float(expected) - float(received)) < 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def payment_key(request_id):
+    return f"payment:{request_id}"
+
+
+def load_payment(request_id):
+    return kv_get(payment_key(request_id))
+
+
+def save_payment(request_id, data):
+    kv_set(payment_key(request_id), data)
+
+
+def cleanup_expired(request_id, record):
+    if (
+        record.get("status") not in ["confirmed"]
+        and (now() - record.get("created_at", now())) > REQUEST_EXPIRY_SECONDS
+    ):
+        record["status"] = "expired"
+        save_payment(request_id, record)
+        kv_srem(PENDING_INDEX_KEY, request_id)
+
+    return record
+
+
+def check_auth(expected_secret):
+    provided = request.headers.get("Authorization", "").strip()
+    return provided == expected_secret
+
+
+# ============================================================
+# CREATE PAYMENT REQUEST
+# ============================================================
+
+@app.route("/api/request-payment", methods=["POST"])
+def request_payment():
+
+    if not check_auth(BOT_SECRET):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True)
+
+    required = [
+        "user_id",
+        "amount",
+        "sender_name",
+        "sender_account",
+        "sender_bank"
+    ]
+
+    missing = [x for x in required if not data.get(x)]
+
+    if missing:
+        return jsonify({
+            "error": "missing fields",
+            "fields": missing
+        }), 400
+
+    request_id = str(uuid.uuid4())
+
+    record = {
+        "request_id": request_id,
+        "user_id": str(data["user_id"]),
+        "amount": str(data["amount"]),
+        "sender_name": str(data["sender_name"]).strip(),
+        "sender_account": str(data["sender_account"]).strip(),
+        "sender_bank": str(data["sender_bank"]).strip(),
+
+        # IMPORTANT:
+        # The bank is saved from the user's input.
+        # It is NOT extracted from the Opay notification.
+
+        "status": "pending",
+
+        "created_at": now(),
+
+        "notification_received": False,
+        "notification_count": 0,
+
+        "matched_notification": None,
+        "last_notification": None,
+
+        "verified_at": None
+    }
+
+    save_payment(request_id, record)
+
+    kv_sadd(PENDING_INDEX_KEY, request_id)
+
+    return jsonify({
+        "request_id": request_id,
+        "status": "pending"
+    })
+
+
+# ============================================================
+# OPAY NOTIFICATION
+#
+# Termux sends:
+# amount
+# sender_name
+# raw
+#
+# NO SENDER BANK
+# ============================================================
+
+@app.route("/api/notify", methods=["POST"])
+def notify():
+
+    if not check_auth(PHONE_SECRET):
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(force=True)
+
+    received_amount = data.get("amount")
+    received_sender = data.get("sender_name") or ""
+    raw = data.get("raw", "")
+
+    if not received_amount:
+        return jsonify({
+            "matched": False,
+            "reason": "no amount parsed"
+        }), 400
+
+    if not received_sender:
+        return jsonify({
+            "matched": False,
+            "reason": "no sender name parsed"
+        }), 400
+
+    pending_ids = kv_smembers(PENDING_INDEX_KEY)
+
+    matched_requests = []
+
+    for request_id in pending_ids:
+
+        record = load_payment(request_id)
+
+        if not record:
+            continue
+
+        record = cleanup_expired(request_id, record)
+
+        if record.get("status") == "expired":
+            continue
+
+        if record.get("status") == "confirmed":
+            continue
+
+        # ONLY sender name + amount are used from the
+        # incoming notification.
+
+        if not names_match(
+            record.get("sender_name"),
+            received_sender
+        ):
+            continue
+
+        if not amounts_match(
+            record.get("amount"),
+            received_amount
+        ):
+            continue
+
+        # IMPORTANT:
+        # DO NOT mark this as matched/confirmed.
+        #
+        # We only store the notification.
+        # The actual confirmation happens ONLY when
+        # /api/verify/<request_id> is called.
+
+        record["notification_received"] = True
+        record["notification_count"] = (
+            int(record.get("notification_count", 0)) + 1
+        )
+
+        record["matched_notification"] = raw
+        record["last_notification"] = {
+            "amount": str(received_amount),
+            "sender_name": received_sender,
+            "raw": raw,
+            "received_at": now()
+        }
+
+        # Keep status as pending.
+        record["status"] = "pending"
+
+        save_payment(request_id, record)
+
+        # DO NOT remove request from pending_index.
+        # This allows repeated notifications to be processed.
+
+        matched_requests.append(request_id)
+
+    if matched_requests:
+
+        return jsonify({
+            "matched": True,
+            "verified": False,
+            "status": "pending",
+            "request_ids": matched_requests,
+            "message": "Notification received. Waiting for bot verification."
+        })
+
+    return jsonify({
+        "matched": False,
+        "verified": False,
+        "status": "pending",
+        "reason": "no matching pending request"
+    })
+
+
+# ============================================================
+# VERIFY PAYMENT
+#
+# This is the ONLY place where a payment becomes confirmed.
+# ============================================================
+
+@app.route("/api/verify/<request_id>", methods=["GET"])
+def verify(request_id):
+
+    if not check_auth(BOT_SECRET):
+        return jsonify({"error": "unauthorized"}), 401
+
+    record = load_payment(request_id)
+
+    if not record:
+        return jsonify({
+            "status": "not_found"
+        }), 404
+
+    record = cleanup_expired(request_id, record)
+
+    if record.get("status") == "expired":
+        return jsonify({
+            "status": "expired"
+        })
+
+    # Already confirmed
+    if record.get("status") == "confirmed":
+        return jsonify({
+            "status": "confirmed",
+            "detail": record.get("matched_notification"),
+            "sender_bank": record.get("sender_bank")
+        })
+
+    # No notification has reached Termux/API yet.
+    if not record.get("notification_received"):
+
+        return jsonify({
+            "status": "pending",
+            "verified": False,
+            "sender_name": record.get("sender_name"),
+            "sender_bank": record.get("sender_bank"),
+            "amount": record.get("amount")
+        })
+
+    notification = record.get("last_notification") or {}
+
+    notification_amount = notification.get("amount")
+    notification_sender = notification.get("sender_name")
+
+    # Verify amount again
+    if not amounts_match(
+        record.get("amount"),
+        notification_amount
+    ):
+
+        return jsonify({
+            "status": "pending",
+            "verified": False,
+            "reason": "payment amount does not match"
+        })
+
+    # Verify sender name again
+    if not names_match(
+        record.get("sender_name"),
+        notification_sender
+    ):
+
+        return jsonify({
+            "status": "pending",
+            "verified": False,
+            "reason": "sender name does not match"
+        })
+
+    # ========================================================
+    # PAYMENT IS NOW CONFIRMED
+    #
+    # sender_bank is the bank entered by the user when
+    # creating the request. We do NOT compare it with
+    # anything from the Opay notification.
+    # ========================================================
+
+    record["status"] = "confirmed"
+    record["verified_at"] = now()
+
+    save_payment(request_id, record)
+
+    # Keep the request in storage but remove from the
+    # active pending index because it is now confirmed.
+    kv_srem(PENDING_INDEX_KEY, request_id)
+
+    return jsonify({
+        "status": "confirmed",
+        "verified": True,
+        "detail": record.get("matched_notification"),
+        "sender_name": record.get("sender_name"),
+        "sender_bank": record.get("sender_bank"),
+        "amount": record.get("amount")
+    })
+
+
+# ============================================================
+# DEBUG
+# ============================================================
+
+@app.route("/api/debug-secret", methods=["GET"])
+def debug_secret():
+
+    return jsonify({
+        "bot_secret_length": len(BOT_SECRET),
+        "bot_secret_first4": BOT_SECRET[:4],
+        "bot_secret_last4": BOT_SECRET[-4:],
+        "phone_secret_length": len(PHONE_SECRET),
+        "using_default_bot_secret": (
+            BOT_SECRET == "change-me-bot-secret"
+        )
+    })
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.route("/api/index", methods=["GET"])
+@app.route("/api", methods=["GET"])
+@app.route("/", methods=["GET"])
+def health():
+
+    return jsonify({
+        "ok": True,
+        "service": "opay payment verification api"
+    })    if USE_LOCAL_FALLBACK:
         _local_sets.setdefault(set_key, set()).add(member)
         return
     requests.post(f"{KV_URL}/sadd/{set_key}/{member}", headers=_headers(), timeout=10)
